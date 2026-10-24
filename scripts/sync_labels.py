@@ -22,12 +22,31 @@ from pathlib import Path
 try:
     import yaml
 except ModuleNotFoundError:  # pragma: no cover - guidance for local runs
-    sys.exit(
-        "PyYAML is required. Run via:\n"
-        "  uv run --with pyyaml python scripts/sync_labels.py"
-    )
+    sys.exit("PyYAML is required. Run via:\n  uv run --with pyyaml python scripts/sync_labels.py")
 
 LABELS_FILE = Path(__file__).resolve().parent.parent / ".github" / "labels.yml"
+
+
+def harden_stdio() -> None:
+    """Keep the non-ASCII status glyphs (✓/✗/—) intact on any host locale.
+
+    Redirected stdout/stderr use the ANSI code page on Windows (cp1252/cp936)
+    and the ASCII C locale on POSIX, none of which can encode the status
+    glyphs: without this, the script dies with UnicodeEncodeError after
+    ``gh label create`` has already run, leaving the sync half-applied.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            if stream.isatty():
+                # A console already transcodes through WriteConsoleW; just make
+                # unencodable characters non-fatal.
+                stream.reconfigure(errors="backslashreplace")
+            else:
+                stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (OSError, ValueError):  # pragma: no cover - exotic stdio wrappers
+            continue
 
 
 def load_labels(path: Path) -> list[dict[str, str]]:
@@ -56,7 +75,13 @@ def sync_label(label: dict[str, str], repo: str | None, dry_run: bool) -> bool:
         print(f"[dry-run] {' '.join(cmd)}")
         return True
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
     if result.returncode != 0:
         print(f"  ✗ {name}: {result.stderr.strip()}", file=sys.stderr)
         return False
@@ -65,6 +90,7 @@ def sync_label(label: dict[str, str], repo: str | None, dry_run: bool) -> bool:
 
 
 def main() -> int:
+    harden_stdio()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", help="Target repository as OWNER/NAME")
     parser.add_argument(
@@ -78,9 +104,7 @@ def main() -> int:
     target = args.repo or "(current repository)"
     print(f"Syncing {len(labels)} labels to {target}")
 
-    failures = sum(
-        0 if sync_label(label, args.repo, args.dry_run) else 1 for label in labels
-    )
+    failures = sum(0 if sync_label(label, args.repo, args.dry_run) else 1 for label in labels)
 
     if failures:
         print(f"\n{failures} label(s) failed to sync", file=sys.stderr)
